@@ -1,0 +1,205 @@
+import oci
+import pandas as pd
+import logging
+import argparse
+import sys
+from datetime import datetime
+
+# ---------------- ARGUMENTS ---------------- #
+parser = argparse.ArgumentParser(
+    description="OCI Compute Inventory from Instance OCIDs"
+)
+parser.add_argument(
+    "ocid_file",
+    help="Path to TXT file containing instance OCIDs (one per line)"
+)
+args = parser.parse_args()
+OCID_FILE = args.ocid_file
+
+# ---------------- CONFIG ---------------- #
+PROFILE = "RIYADH-SPB"
+
+# ---------------- LOGGING ---------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logging.info("OCI Compute Inventory Script started (OCID input)")
+
+# ---------------- READ OCIDS ---------------- #
+try:
+    with open(OCID_FILE, "r") as f:
+        instance_ocids = [line.strip() for line in f if line.strip()]
+except FileNotFoundError:
+    logging.error(f"OCID file not found: {OCID_FILE}")
+    sys.exit(1)
+
+if not instance_ocids:
+    logging.error("OCID file is empty")
+    sys.exit(1)
+
+logging.info(f"Loaded {len(instance_ocids)} instance OCIDs")
+
+# ---------------- OCI CLIENTS ---------------- #
+config = oci.config.from_file(profile_name=PROFILE)
+
+identity_client = oci.identity.IdentityClient(config)
+compute_client = oci.core.ComputeClient(config)
+network_client = oci.core.VirtualNetworkClient(config)
+block_client = oci.core.BlockstorageClient(config)
+
+# ---------------- DATA ---------------- #
+rows = []
+shape_cache = {}
+
+# ---------------- PROCESS ---------------- #
+for instance_ocid in instance_ocids:
+    try:
+        inst = compute_client.get_instance(instance_ocid).data
+        comp_id = inst.compartment_id
+        comp = identity_client.get_compartment(comp_id).data
+
+        logging.info(f"Processing instance: {inst.display_name}")
+
+        # -------- SHAPE CACHE -------- #
+        if comp_id not in shape_cache:
+            shapes = oci.pagination.list_call_get_all_results(
+                compute_client.list_shapes,
+                comp_id
+            ).data
+            shape_cache[comp_id] = {s.shape: s for s in shapes}
+
+        # -------- TAGS -------- #
+        tags = inst.defined_tags or {}
+        application_tag = tags.get("Application", {}).get("application")
+        environment_tag = tags.get("Environment", {}).get("environment")
+
+        # -------- CPU / MEMORY -------- #
+        ocpu = memory = None
+        if inst.shape_config:
+            ocpu = inst.shape_config.ocpus
+            memory = inst.shape_config.memory_in_gbs
+        else:
+            shape = shape_cache[comp_id].get(inst.shape)
+            if shape:
+                ocpu = shape.ocpus
+                memory = shape.memory_in_gbs
+
+        # -------- OPERATING SYSTEM -------- #
+        os_name = os_version = None
+        try:
+            if inst.source_details and hasattr(inst.source_details, "image_id"):
+                image = compute_client.get_image(
+                    inst.source_details.image_id
+                ).data
+                os_name = image.operating_system
+                os_version = image.operating_system_version
+        except Exception as e:
+            logging.warning(f"OS fetch failed for {inst.display_name}: {e}")
+
+        # -------- NETWORK -------- #
+        private_ip = subnet_name = subnet_ocid = None
+        try:
+            vnic_attachments = oci.pagination.list_call_get_all_results(
+                compute_client.list_vnic_attachments,
+                compartment_id=comp_id,
+                instance_id=inst.id
+            ).data
+
+            if vnic_attachments:
+                vnic = network_client.get_vnic(
+                    vnic_attachments[0].vnic_id
+                ).data
+                private_ip = vnic.private_ip
+
+                subnet = network_client.get_subnet(
+                    vnic.subnet_id
+                ).data
+                subnet_name = subnet.display_name
+                subnet_ocid = subnet.id
+        except Exception as e:
+            logging.warning(f"Network fetch failed for {inst.display_name}: {e}")
+
+        # -------- PARTITIONS (BOOT + BLOCK VOLUMES) -------- #
+        partitions = []
+
+        try:
+            # Boot volume
+            boot_attachments = oci.pagination.list_call_get_all_results(
+                compute_client.list_boot_volume_attachments,
+                inst.availability_domain,
+                comp_id,
+                instance_id=inst.id
+            ).data
+
+            if boot_attachments:
+                bv = block_client.get_boot_volume(
+                    boot_attachments[0].boot_volume_id
+                ).data
+                partitions.append(str(bv.size_in_gbs))
+
+            # Block volumes
+            block_attachments = oci.pagination.list_call_get_all_results(
+                compute_client.list_volume_attachments,
+                compartment_id=comp_id,
+                instance_id=inst.id
+            ).data
+
+            for ba in block_attachments:
+                vol = block_client.get_volume(ba.volume_id).data
+                partitions.append(str(vol.size_in_gbs))
+
+        except Exception as e:
+            logging.warning(f"Partition fetch failed for {inst.display_name}: {e}")
+
+        partitions_value = " + ".join(partitions) if partitions else None
+
+        # -------- DATE HANDLING -------- #
+        provisioned_dt = inst.time_created
+        provisioned_display = provisioned_dt.strftime(
+            "%a, %b %d, %Y, %H:%M:%S UTC"
+        )
+
+        # -------- APPEND ROW -------- #
+        rows.append({
+            "_provisioned_sort": provisioned_dt,
+            "Provisioned Date": provisioned_display,
+            "Compartment": comp.name,
+            "OCI Subnet": subnet_name,
+            "Subnet OCID": subnet_ocid,
+            "Instance OCID": inst.id,
+            "OCI VM IP Address": private_ip,
+            "Instance Display Name": inst.display_name,
+            "Current OCPU": ocpu,
+            "Current Memory (GB)": memory,
+            "Partitions": partitions_value,
+            "Application Tag (application)": application_tag,
+            "Environment Tag (environment)": environment_tag,
+            "Operating System": (
+                f"{os_name} {os_version}" if os_name else None
+            ),
+            "Domain": inst.availability_domain,
+            "Compute": inst.shape,
+            "Machine Status": inst.lifecycle_state,
+            "Region": config["region"]
+        })
+
+    except Exception as e:
+        logging.error(f"Failed processing OCID {instance_ocid}: {e}")
+
+# ---------------- EXPORT ---------------- #
+df = pd.DataFrame(rows)
+
+# Sort oldest to newest
+df.sort_values(by="_provisioned_sort", ascending=True, inplace=True)
+
+# Drop helper column
+df.drop(columns=["_provisioned_sort"], inplace=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_file = f"oci_compute_inventory_from_ocids_{timestamp}.xlsx"
+
+df.to_excel(output_file, index=False)
+
+logging.info(f"Inventory exported successfully: {output_file}")
